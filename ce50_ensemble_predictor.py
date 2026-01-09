@@ -42,6 +42,14 @@ from datetime import datetime
 import warnings
 warnings.filterwarnings('ignore')
 
+# Import structural features module
+try:
+    from structural_features import StructuralFeatureExtractor
+    STRUCTURAL_FEATURES_AVAILABLE = True
+except ImportError:
+    STRUCTURAL_FEATURES_AVAILABLE = False
+    print("Warning: structural_features module not available. Structural features will be disabled.")
+
 # Configuration
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
@@ -95,6 +103,50 @@ class DualFingerprintGenerator:
             'count': np.array(count_fps),
             'valid_mask': valid_mask
         }
+
+    def generate_all_features(self, smiles_list, use_structural=False, structural_extractor=None):
+        """
+        Generate fingerprints + structural features (if enabled).
+
+        Parameters:
+        -----------
+        smiles_list : list
+            List of SMILES strings
+        use_structural : bool
+            Whether to extract structural features
+        structural_extractor : StructuralFeatureExtractor or None
+            Feature extractor instance
+
+        Returns:
+        --------
+        dict with 'binary', 'count', 'structural', 'valid_mask'
+        """
+        # Generate fingerprints
+        fps = self.generate_both(smiles_list)
+
+        if not use_structural or not STRUCTURAL_FEATURES_AVAILABLE or structural_extractor is None:
+            fps['structural'] = None
+            return fps
+
+        # Extract structural features
+        structural_features = []
+        for i, smiles in enumerate(smiles_list):
+            if not fps['valid_mask'][i]:
+                structural_features.append(None)
+                continue
+
+            features = structural_extractor.extract_features(smiles)
+            if features is None:
+                # Graceful degradation: use zeros when 3D generation fails
+                features = np.zeros(structural_extractor.n_features)
+
+            structural_features.append(features)
+
+        # Filter out None values (keep only valid features)
+        valid_structural = [f for f in structural_features if f is not None]
+        fps['structural'] = np.array(valid_structural) if valid_structural else None
+
+        return fps
 
 
 class ApplicabilityDomain:
@@ -225,11 +277,21 @@ class ApplicabilityDomain:
 class EnsembleModel:
     """4-model ensemble with dynamic selection"""
 
-    def __init__(self):
+    def __init__(self, use_structural=False):
         self.models = {}
         self.model_scores = {}
         self.applicability_domain = ApplicabilityDomain()
         self.fingerprint_generator = DualFingerprintGenerator()
+        self.use_structural = use_structural
+
+        # Initialize structural feature extractor if enabled
+        if self.use_structural and STRUCTURAL_FEATURES_AVAILABLE:
+            self.structural_extractor = StructuralFeatureExtractor()
+            print("Structural features enabled - enhanced CE50 prediction mode")
+        else:
+            self.structural_extractor = None
+            if self.use_structural and not STRUCTURAL_FEATURES_AVAILABLE:
+                print("Warning: Structural features requested but module not available. Falling back to fingerprints only.")
 
     def build_pipeline(self, model_type, model_name):
         """Build sklearn pipeline with scaler and model"""
@@ -263,9 +325,15 @@ class EnsembleModel:
                 f'{model_type}__colsample_bytree': [0.8, 1.0]
             }
 
-    def train_single_model(self, X_train, y_train, model_type, fp_type):
+    def train_single_model(self, X_train, y_train, model_type, fp_type, X_structural=None):
         """Train a single model with hyperparameter optimization"""
-        print(f"\nTraining {model_type.upper()} with {fp_type} fingerprints...")
+        # Concatenate fingerprints with structural features if available
+        if X_structural is not None and self.use_structural:
+            X_combined = np.hstack([X_train, X_structural])
+            print(f"\nTraining {model_type.upper()} with {fp_type} fingerprints + {X_structural.shape[1]} structural features...")
+        else:
+            X_combined = X_train
+            print(f"\nTraining {model_type.upper()} with {fp_type} fingerprints...")
 
         pipeline = self.build_pipeline(model_type, model_type)
         param_grid = self.get_param_grid(model_type)
@@ -284,17 +352,20 @@ class EnsembleModel:
             verbose=1
         )
 
-        grid_search.fit(X_train, y_train)
+        grid_search.fit(X_combined, y_train)
 
         print(f"Best {model_type.upper()}-{fp_type} params: {grid_search.best_params_}")
         print(f"Best CV R² score: {grid_search.best_score_:.4f}")
 
         return grid_search.best_estimator_, grid_search.best_score_
 
-    def train_ensemble(self, X_binary, X_count, y):
+    def train_ensemble(self, X_binary, X_count, y, X_structural=None):
         """Train all 4 models in the ensemble"""
         print("\n" + "="*80)
-        print("TRAINING 4-MODEL ENSEMBLE")
+        if self.use_structural and X_structural is not None:
+            print("TRAINING 4-MODEL ENSEMBLE (WITH STRUCTURAL FEATURES)")
+        else:
+            print("TRAINING 4-MODEL ENSEMBLE")
         print("="*80)
 
         # Split data
@@ -304,6 +375,15 @@ class EnsembleModel:
         X_count_train, X_count_test, _, _ = train_test_split(
             X_count, y, test_size=0.2, random_state=RANDOM_STATE
         )
+
+        # Split structural features if provided
+        if X_structural is not None and self.use_structural:
+            X_structural_train, X_structural_test, _, _ = train_test_split(
+                X_structural, y, test_size=0.2, random_state=RANDOM_STATE
+            )
+        else:
+            X_structural_train = None
+            X_structural_test = None
 
         # Fit applicability domain
         print("\nFitting applicability domain models...")
@@ -319,13 +399,16 @@ class EnsembleModel:
 
         for model_type, fp_type, X_train in models_to_train:
             model_name = f"{model_type}_{fp_type}"
-            model, cv_score = self.train_single_model(X_train, y_train, model_type, fp_type)
+            model, cv_score = self.train_single_model(
+                X_train, y_train, model_type, fp_type, X_structural=X_structural_train
+            )
             self.models[model_name] = model
             self.model_scores[model_name] = cv_score
 
         # Store test data for evaluation
         self.X_binary_test = X_binary_test
         self.X_count_test = X_count_test
+        self.X_structural_test = X_structural_test
         self.y_test = y_test
 
         return self.models, self.model_scores
@@ -351,10 +434,15 @@ class EnsembleModel:
 
         Returns detailed predictions for each molecule
         """
-        # Generate fingerprints
-        fps = self.fingerprint_generator.generate_both(smiles_list)
+        # Generate fingerprints and structural features
+        fps = self.fingerprint_generator.generate_all_features(
+            smiles_list,
+            use_structural=self.use_structural,
+            structural_extractor=self.structural_extractor
+        )
         X_binary = fps['binary']
         X_count = fps['count']
+        X_structural = fps['structural']
 
         results = []
 
@@ -367,8 +455,14 @@ class EnsembleModel:
                 fp_type = 'binary' if 'binary' in model_name else 'count'
                 X = X_binary[i:i+1] if fp_type == 'binary' else X_count[i:i+1]
 
-                pred = model.predict(X)[0]
-                uncertainty = self.calculate_model_uncertainty(model, X, model_name)[0]
+                # Concatenate structural features if available
+                if X_structural is not None and self.use_structural:
+                    X_combined = np.hstack([X, X_structural[i:i+1]])
+                else:
+                    X_combined = X
+
+                pred = model.predict(X_combined)[0]
+                uncertainty = self.calculate_model_uncertainty(model, X_combined, model_name)[0]
 
                 predictions[model_name] = pred
                 uncertainties[model_name] = uncertainty
@@ -445,7 +539,13 @@ class EnsembleModel:
             fp_type = 'binary' if 'binary' in model_name else 'count'
             X_test = self.X_binary_test if fp_type == 'binary' else self.X_count_test
 
-            y_pred = model.predict(X_test)
+            # Concatenate structural features if available
+            if self.X_structural_test is not None and self.use_structural:
+                X_test_combined = np.hstack([X_test, self.X_structural_test])
+            else:
+                X_test_combined = X_test
+
+            y_pred = model.predict(X_test_combined)
 
             r2 = r2_score(self.y_test, y_pred)
             mae = mean_absolute_error(self.y_test, y_pred)

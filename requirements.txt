@@ -1,3 +1,10 @@
 pytest
 numpy
 ase
+pandas
+scikit-learn
+xgboost
+matplotlib
+seaborn
+joblib
+rdkit
