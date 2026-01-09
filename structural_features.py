@@ -315,7 +315,8 @@ class StructuralFeatureExtractor:
 
             # Lookup UFF parameters
             try:
-                uff_row = self.uff_table.lookup(element, n_bonds, avg_angle, tolerance=20)
+                # Try with tight tolerance first
+                uff_row = self.uff_table.lookup(element, n_bonds, avg_angle, tolerance=10)
 
                 bond_energies.append(uff_row['energy'])
                 vdw_distances.append(uff_row['distance'])
@@ -327,7 +328,20 @@ class StructuralFeatureExtractor:
                 angle_strains.append(strain)
 
             except (NonExistentElementError, NonExistentCoordinationError, NonExistentAngleError):
-                # Atom not in UFF table or unusual coordination - skip
+                # Try looser tolerance if tight one fails
+                try:
+                    uff_row = self.uff_table.lookup(element, n_bonds, avg_angle, tolerance=5)
+                    bond_energies.append(uff_row['energy'])
+                    vdw_distances.append(uff_row['distance'])
+                    charges.append(abs(uff_row['charge']))
+                    coordination_nums.append(uff_row['coordination'])
+                    strain = abs(avg_angle - uff_row['angle'])
+                    angle_strains.append(strain)
+                except:
+                    # Atom not in UFF table or unusual coordination - skip
+                    pass
+            except Exception:
+                # Catch any other lookup errors (like multiplicity)
                 pass
 
         # Return aggregated UFF features
